@@ -1,0 +1,114 @@
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+#include <TinyGPS++.h>
+#include <HardwareSerial.h>
+
+// Konfiguracja Pinów
+const int pinMorse = 8;   // Dioda/Buzzer
+const int RXPin = 2;      // Do niego podłącz TX modułu GPS
+const int TXPin = 3;      // Do niego podłącz RX modułu GPS
+const uint32_t GPSBaud = 9600;
+
+// Obiekty
+TinyGPSPlus gps;
+HardwareSerial gpsSerial(1); // Używamy drugiego portu UART
+BLECharacteristic *pTxCharacteristic;
+bool deviceConnected = false;
+unsigned long lastUpdate = 0;
+
+// UUID Serwisu UART
+#define SERVICE_UUID           "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+#define CHARACTERISTIC_UUID_RX "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
+#define CHARACTERISTIC_UUID_TX "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
+
+const char* morseAlphabet[] = {
+  ".-", "-...", "-.-.", "-..", ".", "..-.", "--.", "....", "..", ".---", "-.-", ".-..", "--", "-.", "---", ".--.", "--.-", ".-.", "...", "-", "..-", "...-", ".--", "-..-", "-.--", "--.."
+};
+
+void playMorse(String code) {
+  for (int i = 0; i < code.length(); i++) {
+    int duration = (code[i] == '.') ? 200 : 600;
+    digitalWrite(pinMorse, HIGH);
+    delay(duration);
+    digitalWrite(pinMorse, LOW);
+    delay(200);
+  }
+}
+
+class MyServerCallbacks: public BLEServerCallbacks {
+    void onConnect(BLEServer* pServer) { deviceConnected = true; };
+    void onDisconnect(BLEServer* pServer) { 
+      deviceConnected = false;
+      pServer->getAdvertising()->start();
+    }
+};
+
+class MorseCallbacks: public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic *pCharacteristic) {
+      String rxValue = pCharacteristic->getValue(); 
+      if (rxValue.length() > 0) {
+        rxValue.toUpperCase();
+        String outputMorse = "";
+        for (int i = 0; i < rxValue.length(); i++) {
+          char c = rxValue[i];
+          if (c >= 'A' && c <= 'Z') {
+            String mCode = morseAlphabet[c - 'A'];
+            outputMorse += mCode + " ";
+            playMorse(mCode);
+          } else if (c == ' ') {
+            outputMorse += "/ ";
+            delay(400);
+          }
+        }
+        pTxCharacteristic->setValue(outputMorse.c_str());
+        pTxCharacteristic->notify();
+      }
+    }
+};
+
+void setup() {
+  Serial.begin(115200);
+  gpsSerial.begin(GPSBaud, SERIAL_8N1, RXPin, TXPin);
+  pinMode(pinMorse, OUTPUT);
+
+  BLEDevice::init("ESP32-C3-GPS-Morse");
+  BLEServer *pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+  pTxCharacteristic = pService->createCharacteristic(CHARACTERISTIC_UUID_TX, BLECharacteristic::PROPERTY_NOTIFY);
+  pTxCharacteristic->addDescriptor(new BLE2902());
+
+  BLECharacteristic *pRxCharacteristic = pService->createCharacteristic(CHARACTERISTIC_UUID_RX, BLECharacteristic::PROPERTY_WRITE);
+  pRxCharacteristic->setCallbacks(new MorseCallbacks());
+
+  pService->start();
+  pServer->getAdvertising()->start();
+  Serial.println("System GPS + Morse gotowy!");
+}
+
+void loop() {
+  // Odczyt danych z GPS
+  while (gpsSerial.available() > 0) {
+    gps.encode(gpsSerial.read());
+  }
+
+  // Wysyłanie lokalizacji co 5 sekund do Bluetooth
+  if (deviceConnected && (millis() - lastUpdate > 5000)) {
+    String dataToSend;
+    
+    if (gps.location.isValid()) {
+      dataToSend = "Lat: " + String(gps.location.lat(), 6) + 
+                   " Lng: " + String(gps.location.lng(), 6) +
+                   " Sat: " + String(gps.satellites.value());
+    } else {
+      dataToSend = "Szukam satelit... (Sat: " + String(gps.satellites.value()) + ")";
+    }
+
+    pTxCharacteristic->setValue(dataToSend.c_str());
+    pTxCharacteristic->notify();
+    lastUpdate = millis();
+  }
+}
